@@ -9,7 +9,7 @@ const usage =
     \\  --stdout       write the value of the chosen field to stdout,
     \\                 otherwise paste it to the clipboard with wl-copy
     \\                 (only affects 'get' subcommand)
-    \\  -d filepath    path to database file, defaults to default.keypit in cwd
+    \\  -d filepath    path to database file, defaults to $XDG_DATA_HOME/keypit.db
     \\  -p password    password used to decrypt and/or encrypt the database file,
     \\                 you will be prompted if -p is not provided
     \\  -h --help      show this
@@ -54,7 +54,7 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(arena);
 
     var use_clipboard = true;
-    var filepath: []const u8 = "default.keypit";
+    var filepath_opt: ?[]const u8 = null;
     var password: ?[]const u8 = null;
     var subcommand_opt: ?enum { get, show, modify, new, remove } = null;
     var pairs: std.ArrayList(struct { name: []const u8, val: []const u8 }) = .init(arena);
@@ -71,7 +71,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "-d")) {
             i += 1;
             if (i >= args.len) fatal("expected filepath after -d", .{});
-            filepath = args[i];
+            filepath_opt = args[i];
         } else if (std.mem.eql(u8, args[i], "-p")) {
             i += 1;
             if (i >= args.len) fatal("expected password after -p", .{});
@@ -111,6 +111,11 @@ pub fn main() !void {
             if (entry_name == null) fatal("subcommand '{s}' expects an entry name", .{@tagName(subcommand)});
         },
     }
+
+    const filepath = if (filepath_opt) |f| f else blk: {
+        const xdg_data_home = std.posix.getenv("XDG_DATA_HOME") orelse fatal("XDG_DATA_HOME is undefined", .{});
+        break :blk try std.fs.path.join(arena, &.{ xdg_data_home, "keypit.db" });
+    };
 
     const file = std.fs.cwd().openFile(filepath, .{}) catch |err| switch (err) {
         error.FileNotFound => switch (subcommand) {
