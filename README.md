@@ -6,4 +6,7 @@ one change i could make:
  instead of using arrayListUnmanaged, use arrayHashMap..
  but not really necessary
 
+ could hang keypit after a 'get' command
+ and make the clipboard empty when keypit is closed?
+
 

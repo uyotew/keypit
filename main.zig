@@ -117,7 +117,16 @@ pub fn main() !void {
         break :blk try std.fs.path.join(arena, &.{ xdg_data_home, "keypit.db" });
     };
 
-    const file = std.fs.cwd().openFile(filepath, .{}) catch |err| switch (err) {
+    // the file is always only read, and replaced with an atomic file.
+    // this is only checked so that modifying operations on read only files
+    // error out early (skips password prompt), and
+    // arent replaced with a new file if something is modified.
+    const open_mode: std.fs.File.OpenMode = switch (subcommand) {
+        .modify, .remove, .new => .read_write,
+        .show, .get => .read_only,
+    };
+
+    const file = std.fs.cwd().openFile(filepath, .{ .mode = open_mode }) catch |err| switch (err) {
         error.FileNotFound => switch (subcommand) {
             .modify, .show, .get, .remove => {
                 fatal("subcommand '{s}' is useless on nonexistent file: {s}", .{ @tagName(subcommand), filepath });
