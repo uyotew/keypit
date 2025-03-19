@@ -40,6 +40,12 @@ const usage =
     \\     'p' and 'e' works also, where 'p' is all printable characters,
     \\     and 'e' is every byte from 0 to 255.
     \\
+    \\  copy name new-name
+    \\  rename name new-name
+    \\
+    \\     copy will create a new entry, with a new creation timestamp
+    \\     rename will only change the entry's name
+    \\
     \\  remove name
     \\
     \\     removes the entire entry
@@ -56,10 +62,11 @@ pub fn main() !void {
     var use_clipboard = true;
     var filepath_opt: ?[]const u8 = null;
     var password: ?[]const u8 = null;
-    var subcommand_opt: ?enum { get, show, modify, new, remove } = null;
+    var subcommand_opt: ?enum { get, show, modify, new, copy, rename, remove } = null;
     var pairs: std.ArrayList(struct { name: []const u8, val: []const u8 }) = .init(arena);
     var entry_name: ?[]const u8 = null;
-    var field_name: ?[]const u8 = null;
+    // field name for get, and new name for copy and rename
+    var field_name_or_new_name: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -84,15 +91,19 @@ pub fn main() !void {
             subcommand_opt = .modify;
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "new")) {
             subcommand_opt = .new;
+        } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "copy")) {
+            subcommand_opt = .copy;
+        } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "rename")) {
+            subcommand_opt = .rename;
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "remove")) {
             subcommand_opt = .remove;
         } else if (subcommand_opt != null and entry_name == null) {
             entry_name = args[i];
         } else if (subcommand_opt) |sub| {
             switch (sub) {
-                .get => {
-                    if (field_name != null) fatal("unrecognized argument '{s}'", .{args[i]});
-                    field_name = args[i];
+                .get, .copy, .rename => {
+                    if (field_name_or_new_name != null) fatal("unrecognized argument '{s}'", .{args[i]});
+                    field_name_or_new_name = args[i];
                 },
                 .modify, .new => if (std.mem.indexOfScalar(u8, args[i], '=')) |eq_i| {
                     try pairs.append(.{
@@ -107,7 +118,7 @@ pub fn main() !void {
     const subcommand = subcommand_opt orelse fatal("expected subcommand", .{});
     switch (subcommand) {
         .show => {},
-        .modify, .new, .get, .remove => {
+        .modify, .new, .get, .copy, .rename, .remove => {
             if (entry_name == null) fatal("subcommand '{s}' expects an entry name", .{@tagName(subcommand)});
         },
     }
@@ -122,13 +133,13 @@ pub fn main() !void {
     // error out early (skips password prompt), and
     // arent replaced with a new file if something is modified.
     const open_mode: std.fs.File.OpenMode = switch (subcommand) {
-        .modify, .remove, .new => .read_write,
+        .modify, .new, .copy, .rename, .remove => .read_write,
         .show, .get => .read_only,
     };
 
     const file = std.fs.cwd().openFile(filepath, .{ .mode = open_mode }) catch |err| switch (err) {
         error.FileNotFound => switch (subcommand) {
-            .modify, .show, .get, .remove => {
+            .show, .get, .modify, .copy, .rename, .remove => {
                 fatal("subcommand '{s}' is useless on nonexistent file: {s}", .{ @tagName(subcommand), filepath });
             },
             .new => null,
@@ -162,7 +173,7 @@ pub fn main() !void {
             for (database.entries.items) |e| {
                 if (std.mem.eql(u8, entry_name.?, e.name)) {
                     var value: []const u8 = undefined;
-                    if (field_name) |f_n| {
+                    if (field_name_or_new_name) |f_n| {
                         for (e.fields.items) |f| {
                             if (std.mem.eql(u8, f.name, f_n)) {
                                 value = f.val;
@@ -190,14 +201,6 @@ pub fn main() !void {
                         try stdout.print("{s}\n", .{value});
                     }
                     std.process.exit(0);
-                }
-            } else fatal("entry '{s}' not found", .{entry_name.?});
-        },
-        .remove => {
-            for (database.entries.items, 0..) |e, e_i| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) {
-                    _ = database.entries.swapRemove(e_i);
-                    break;
                 }
             } else fatal("entry '{s}' not found", .{entry_name.?});
         },
@@ -244,6 +247,46 @@ pub fn main() !void {
                     try entry.fields.append(arena, try .fromRaw(arena, p.name, p.val));
                 }
             }
+        },
+        .copy => {
+            const e_i = for (database.entries.items, 0..) |e, e_i| {
+                if (std.mem.eql(u8, entry_name.?, e.name)) break e_i;
+            } else fatal("entry '{s}' not found", .{entry_name.?});
+            const entry = database.entries.items[e_i];
+            const new_name = field_name_or_new_name orelse fatal("expected new name after '{s}'", .{entry_name.?});
+
+            for (database.entries.items) |e| {
+                if (std.mem.eql(u8, new_name, e.name)) fatal("entry name '{s}' already in use", .{new_name});
+            }
+            const timestamp = std.time.timestamp();
+
+            try database.entries.append(arena, .{
+                .created = timestamp,
+                .modified = timestamp,
+                .name = new_name,
+                .fields = entry.fields,
+            });
+        },
+        .rename => {
+            const e_i = for (database.entries.items, 0..) |e, e_i| {
+                if (std.mem.eql(u8, entry_name.?, e.name)) break e_i;
+            } else fatal("entry '{s}' not found", .{entry_name.?});
+            const entry = &database.entries.items[e_i];
+            const new_name = field_name_or_new_name orelse fatal("expected new name after '{s}'", .{entry_name.?});
+
+            for (database.entries.items) |e| {
+                if (std.mem.eql(u8, new_name, e.name)) fatal("entry name '{s}' already in use", .{new_name});
+            }
+            entry.modified = std.time.timestamp();
+            entry.name = new_name;
+        },
+        .remove => {
+            for (database.entries.items, 0..) |e, e_i| {
+                if (std.mem.eql(u8, entry_name.?, e.name)) {
+                    _ = database.entries.swapRemove(e_i);
+                    break;
+                }
+            } else fatal("entry '{s}' not found", .{entry_name.?});
         },
     }
 
