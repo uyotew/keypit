@@ -238,9 +238,7 @@ pub fn main() !void {
                 if (p.val.len == 0) {
                     if (f_i == null) fatal("cannot remove '{s}', since it doesn't exist", .{p.name});
                     _ = entry.fields.swapRemove(f_i.?);
-                    break;
-                }
-                if (f_i) |fi| {
+                } else if (f_i) |fi| {
                     entry.fields.items[fi] = try .fromRaw(arena, p.name, p.val);
                 } else {
                     try entry.fields.append(arena, try .fromRaw(arena, p.name, p.val));
