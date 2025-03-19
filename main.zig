@@ -18,7 +18,8 @@ const usage =
     \\  get name [fieldname]
     \\
     \\     if the entry only has one secret field, 
-    \\     it's value will be retrieved by default
+    \\     it's value will be retrieved by default.
+    \\     and the clipboard will be cleared after one paste.
     \\
     \\  show [name] 
     \\
@@ -186,7 +187,7 @@ pub fn main() !void {
             }
 
             if (use_clipboard) {
-                var proc = std.process.Child.init(&.{ "wl-copy", value }, arena);
+                var proc = std.process.Child.init(&.{ "wl-copy", "-o", value }, arena);
                 _ = proc.spawnAndWait() catch |err| switch (err) {
                     error.FileNotFound => fatal("wl-copy could not be found", .{}),
                     else => return err,
