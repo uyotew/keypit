@@ -33,12 +33,11 @@ const usage =
     \\     if no value is provided after ?, the secret defaults to a random
     \\     64 byte long string of printable characters
     \\
-    \\     if you wish to generate the secret in another way, you can use
+    \\     if you wish to generate the secret differently, you can use
     \\     for example: fieldname=??a30
     \\     where you add an extra ?, and 'a' means alphanumeric,
-    \\     and the number is the amount of characters to be generated.
-    \\     'p' and 'e' works also, where 'p' is all printable characters,
-    \\     and 'e' is every byte from 0 to 255.
+    \\     and the number is the length of the generated string.
+    \\     use 'p' instead of 'a' for all printable characters.
     \\
     \\  copy name new-name
     \\  rename name new-name
@@ -351,18 +350,18 @@ const Database = struct {
                     val = try arena.alloc(u8, 64);
                     try generateSecret(val, .printable);
                 } else if (raw_val[0] == '?' and raw_val[1] == '?') {
-                    if (raw_val.len < 3) fatal("expected either 'e', 'a' or 'p' after {s}=??", .{name});
+                    if (raw_val.len < 3) fatal("expected either 'a' or 'p' after {s}=??", .{name});
                     if (raw_val.len < 4) fatal("expected a number (length) after {s}={s}", .{ name, raw_val });
                     const len = std.fmt.parseInt(u16, raw_val[3..], 10) catch |err| switch (err) {
                         error.Overflow => fatal("{s}={s} length cannot be bigger than a u16", .{ name, raw_val }),
                         error.InvalidCharacter => fatal("expected a number (length) after {s}={s}", .{ name, raw_val[0..3] }),
                     };
+                    if (len == 0) fatal("{s}={s} length cannot be 0", .{ name, raw_val });
                     val = try arena.alloc(u8, len);
                     try generateSecret(val, switch (raw_val[2]) {
-                        'e' => .every,
                         'a' => .alphanumeric,
                         'p' => .printable,
-                        else => fatal("expected either 'e', 'a' or 'p' after {s}=??", .{name}),
+                        else => fatal("expected either 'a' or 'p' after {s}=??", .{name}),
                     });
                 } else if (raw_val[0] == '?') {
                     val = val[1..];
@@ -562,10 +561,9 @@ fn promptForPassword(alc: std.mem.Allocator) ![]const u8 {
     return al.toOwnedSlice();
 }
 
-fn generateSecret(out: []u8, char_set: enum { printable, alphanumeric, every }) !void {
+fn generateSecret(out: []u8, char_set: enum { printable, alphanumeric }) !void {
     try std.posix.getrandom(out);
     switch (char_set) {
-        .every => {},
         .alphanumeric => for (out) |*b| {
             b.* >>= 1;
             while (true) switch (b.*) {
