@@ -62,14 +62,29 @@ pub fn main() !void {
     var filepath_opt: ?[]const u8 = null;
     var password: ?[]const u8 = null;
     var subcommand_opt: ?enum { get, show, modify, new, copy, rename, remove } = null;
-    var pairs: std.ArrayList(struct { name: []const u8, val: []const u8 }) = .init(arena);
+    var pairs: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     var entry_name: ?[]const u8 = null;
     // field name for get, and new name for copy and rename
     var field_name_or_new_name: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
+        if (subcommand_opt != null and entry_name == null) {
+            entry_name = args[i];
+        } else if (subcommand_opt) |sub| {
+            switch (sub) {
+                .get, .copy, .rename => {
+                    if (field_name_or_new_name != null) fatal("unexpected argument '{s}'", .{args[i]});
+                    field_name_or_new_name = args[i];
+                },
+                .modify, .new => if (std.mem.indexOfScalar(u8, args[i], '=')) |eq_i| {
+                    const gop = try pairs.getOrPut(arena, args[i][0..eq_i]);
+                    if (gop.found_existing) fatal("field '{s}' appears more than once", .{gop.key_ptr.*});
+                    gop.value_ptr.* = args[i][eq_i + 1 ..];
+                } else fatal("unexpected argument '{s}'", .{args[i]}),
+                .remove, .show => fatal("unexpected argument '{s}'", .{args[i]}),
+            }
+        } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
             std.log.info("{s}", .{usage});
             std.process.exit(0);
         } else if (std.mem.eql(u8, args[i], "--stdout")) {
@@ -96,24 +111,9 @@ pub fn main() !void {
             subcommand_opt = .rename;
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "remove")) {
             subcommand_opt = .remove;
-        } else if (subcommand_opt != null and entry_name == null) {
-            entry_name = args[i];
-        } else if (subcommand_opt) |sub| {
-            switch (sub) {
-                .get, .copy, .rename => {
-                    if (field_name_or_new_name != null) fatal("unrecognized argument '{s}'", .{args[i]});
-                    field_name_or_new_name = args[i];
-                },
-                .modify, .new => if (std.mem.indexOfScalar(u8, args[i], '=')) |eq_i| {
-                    try pairs.append(.{
-                        .name = args[i][0..eq_i],
-                        .val = args[i][eq_i + 1 ..],
-                    });
-                } else fatal("unrecognized argument '{s}'", .{args[i]}),
-                .remove, .show => fatal("unrecognized argument '{s}'", .{args[i]}),
-            }
         } else fatal("unrecognized subcommand '{s}'", .{args[i]});
     }
+
     const subcommand = subcommand_opt orelse fatal("expected subcommand", .{});
     switch (subcommand) {
         .show => {},
@@ -157,135 +157,95 @@ pub fn main() !void {
     switch (subcommand) {
         .show => {
             if (entry_name) |name| {
-                for (database.entries.items) |e| {
-                    if (std.mem.eql(u8, name, e.name)) {
-                        try stdout.print("{}\n", .{e});
-                        std.process.exit(0);
-                    }
-                } else fatal("entry '{s}' not found", .{name});
+                const entry = database.entries.get(name) orelse fatal("entry '{s}' not found", .{name});
+                try stdout.print("{s}\n{}\n", .{ name, entry });
             } else {
-                for (database.entries.items) |e| try stdout.print("{}\n", .{e});
-                std.process.exit(0);
+                for (database.entries.keys(), database.entries.values()) |entry_n, entry| {
+                    try stdout.print("{s}\n{}\n", .{ entry_n, entry });
+                }
             }
+            std.process.exit(0);
         },
         .get => {
-            for (database.entries.items) |e| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) {
-                    var value: []const u8 = undefined;
-                    if (field_name_or_new_name) |f_n| {
-                        for (e.fields.items) |f| {
-                            if (std.mem.eql(u8, f.name, f_n)) {
-                                value = f.val;
-                                break;
-                            }
-                        } else fatal("field '{s}' not found", .{f_n});
-                    } else {
-                        var secret_fields: u8 = 0;
-                        for (e.fields.items) |f| {
-                            if (f.secret) {
-                                value = f.val;
-                                secret_fields += 1;
-                            }
-                        }
-                        if (secret_fields != 1) fatal("not exactly one secret field, fieldname need to be provided", .{});
-                    }
+            const entry = database.entries.get(entry_name.?) orelse fatal("entry '{s}' not found", .{entry_name.?});
+            var value: []const u8 = undefined;
 
-                    if (use_clipboard) {
-                        var proc = std.process.Child.init(&.{ "wl-copy", value }, arena);
-                        _ = proc.spawnAndWait() catch |err| switch (err) {
-                            error.FileNotFound => fatal("wl-copy could not be found", .{}),
-                            else => return err,
-                        };
-                    } else {
-                        try stdout.print("{s}\n", .{value});
+            if (field_name_or_new_name) |field_name| {
+                const field = entry.fields.get(field_name) orelse fatal("field '{s}' not found", .{field_name});
+                value = field.val;
+            } else {
+                var secret_fields: u8 = 0;
+                for (entry.fields.values()) |field| {
+                    if (field.secret) {
+                        value = field.val;
+                        secret_fields += 1;
                     }
-                    std.process.exit(0);
                 }
-            } else fatal("entry '{s}' not found", .{entry_name.?});
+                if (secret_fields == 0) fatal("no secret fields, fieldname need to be provided", .{});
+                if (secret_fields > 1) fatal("more than one secret field, fieldname need to be provided", .{});
+            }
+
+            if (use_clipboard) {
+                var proc = std.process.Child.init(&.{ "wl-copy", value }, arena);
+                _ = proc.spawnAndWait() catch |err| switch (err) {
+                    error.FileNotFound => fatal("wl-copy could not be found", .{}),
+                    else => return err,
+                };
+            } else {
+                try stdout.print("{s}\n", .{value});
+            }
+            std.process.exit(0);
         },
         .new => {
-            for (database.entries.items) |e| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) fatal("entry name '{s}' already in use", .{entry_name.?});
-            }
+            if (database.entries.contains(entry_name.?)) fatal("entry name '{s}' already in use", .{entry_name.?});
+
             const timestamp = std.time.timestamp();
             var entry: Database.Entry = .{
                 .created = timestamp,
                 .modified = timestamp,
-                .name = entry_name.?,
             };
-            for (pairs.items, 0..) |p, p_i| {
-                for (pairs.items[0..p_i]) |prev_p| {
-                    if (std.mem.eql(u8, p.name, prev_p.name)) fatal("field '{s}' appears more than once", .{p.name});
-                }
-                if (p.val.len == 0) fatal("field '{s}' is empty, no empty values allowed", .{p.name});
-                try entry.fields.append(arena, try .fromRaw(arena, p.name, p.val));
+            for (pairs.keys(), pairs.values()) |field_name, field_raw| {
+                if (field_raw.len == 0) fatal("field '{s}' is empty, no empty values allowed", .{field_name});
+                try entry.fields.putNoClobber(arena, field_name, try .fromRaw(arena, field_name, field_raw));
             }
-            try database.entries.append(arena, entry);
+            try database.entries.putNoClobber(arena, entry_name.?, entry);
         },
         .modify => {
-            const e_i = for (database.entries.items, 0..) |e, e_i| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) break e_i;
-            } else fatal("entry '{s}' not found", .{entry_name.?});
-            const entry = &database.entries.items[e_i];
+            const entry = database.entries.getPtr(entry_name.?) orelse fatal("entry '{s}' not found", .{entry_name.?});
             entry.modified = std.time.timestamp();
 
-            for (pairs.items, 0..) |p, p_i| {
-                for (pairs.items[0..p_i]) |prev_p| {
-                    if (std.mem.eql(u8, p.name, prev_p.name)) fatal("field '{s}' appears more than once", .{p.name});
-                }
-                const f_i: ?usize = for (entry.fields.items, 0..) |f, f_i| {
-                    if (std.mem.eql(u8, f.name, p.name)) break f_i;
-                } else null;
-
-                if (p.val.len == 0) {
-                    if (f_i == null) fatal("cannot remove '{s}', since it doesn't exist", .{p.name});
-                    _ = entry.fields.swapRemove(f_i.?);
-                } else if (f_i) |fi| {
-                    entry.fields.items[fi] = try .fromRaw(arena, p.name, p.val);
+            for (pairs.keys(), pairs.values()) |field_name, field_raw| {
+                if (field_raw.len == 0) {
+                    if (!entry.fields.orderedRemove(field_name)) {
+                        fatal("cannot remove '{s}', since it doesn't exist", .{field_name});
+                    }
                 } else {
-                    try entry.fields.append(arena, try .fromRaw(arena, p.name, p.val));
+                    try entry.fields.put(arena, field_name, try .fromRaw(arena, field_name, field_raw));
                 }
             }
         },
         .copy => {
-            const e_i = for (database.entries.items, 0..) |e, e_i| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) break e_i;
-            } else fatal("entry '{s}' not found", .{entry_name.?});
-            const entry = database.entries.items[e_i];
+            const entry = database.entries.get(entry_name.?) orelse fatal("entry '{s}' not found", .{entry_name.?});
             const new_name = field_name_or_new_name orelse fatal("expected new name after '{s}'", .{entry_name.?});
+            if (database.entries.contains(new_name)) fatal("entry name '{s}' already in use", .{new_name});
 
-            for (database.entries.items) |e| {
-                if (std.mem.eql(u8, new_name, e.name)) fatal("entry name '{s}' already in use", .{new_name});
-            }
             const timestamp = std.time.timestamp();
-
-            try database.entries.append(arena, .{
+            try database.entries.putNoClobber(arena, new_name, .{
                 .created = timestamp,
                 .modified = timestamp,
-                .name = new_name,
                 .fields = entry.fields,
             });
         },
         .rename => {
-            const e_i = for (database.entries.items, 0..) |e, e_i| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) break e_i;
-            } else fatal("entry '{s}' not found", .{entry_name.?});
-            const entry = &database.entries.items[e_i];
+            const index = database.entries.getIndex(entry_name.?) orelse fatal("entry '{s}' not found", .{entry_name.?});
             const new_name = field_name_or_new_name orelse fatal("expected new name after '{s}'", .{entry_name.?});
+            if (database.entries.contains(new_name)) fatal("entry name '{s}' already in use", .{new_name});
 
-            for (database.entries.items) |e| {
-                if (std.mem.eql(u8, new_name, e.name)) fatal("entry name '{s}' already in use", .{new_name});
-            }
-            entry.modified = std.time.timestamp();
-            entry.name = new_name;
+            database.entries.values()[index].modified = std.time.timestamp();
+            try database.entries.setKey(arena, index, new_name);
         },
-        .remove => {
-            for (database.entries.items, 0..) |e, e_i| {
-                if (std.mem.eql(u8, entry_name.?, e.name)) {
-                    _ = database.entries.swapRemove(e_i);
-                    break;
-                }
-            } else fatal("entry '{s}' not found", .{entry_name.?});
+        .remove => if (!database.entries.orderedRemove(entry_name.?)) {
+            fatal("entry '{s}' not found", .{entry_name.?});
         },
     }
 
@@ -319,7 +279,7 @@ pub fn main() !void {
 // field value bytes
 
 const Database = struct {
-    entries: std.ArrayListUnmanaged(Entry) = .{},
+    entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
     tag: ?[16]u8 = null,
 
     const version: u16 = 0;
@@ -335,12 +295,10 @@ const Database = struct {
     const Entry = struct {
         created: i64,
         modified: i64,
-        name: []const u8,
-        fields: std.ArrayListUnmanaged(Field) = .{},
+        fields: std.StringArrayHashMapUnmanaged(Field) = .empty,
 
         const Field = struct {
             secret: bool = false,
-            name: []const u8,
             val: []const u8,
 
             fn fromRaw(arena: std.mem.Allocator, name: []const u8, raw_val: []const u8) !Field {
@@ -368,28 +326,25 @@ const Database = struct {
                 }
                 return .{
                     .secret = raw_val[0] == '?',
-                    .name = name,
                     .val = val,
                 };
             }
         };
 
-        pub fn format(e: Entry, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-            try writer.writeAll(e.name);
-            try writer.writeByte('\n');
+        pub fn format(entry: Entry, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
             try writer.writeAll(" created: ");
-            try dateFormat(e.created, writer);
+            try dateFormat(entry.created, writer);
             try writer.writeByte('\n');
             try writer.writeAll(" modified: ");
-            try dateFormat(e.modified, writer);
+            try dateFormat(entry.modified, writer);
             try writer.writeByte('\n');
 
-            for (e.fields.items) |f| {
-                try writer.print("  {s}: ", .{f.name});
-                if (f.secret) {
-                    try writer.writeByteNTimes('*', f.val.len);
+            for (entry.fields.keys(), entry.fields.values()) |field_name, field| {
+                try writer.print("  {s}: ", .{field_name});
+                if (field.secret) {
+                    try writer.writeByteNTimes('*', field.val.len);
                 } else {
-                    try writer.print("{s}", .{f.val});
+                    try writer.print("{s}", .{field.val});
                 }
                 try writer.writeByte('\n');
             }
@@ -416,12 +371,13 @@ const Database = struct {
         };
     }
 
-    // returned array list holds references to slices in buf
-    fn parseEntries(alc: std.mem.Allocator, buf: []const u8) !std.ArrayListUnmanaged(Entry) {
+    // returned hash map holds references to slices in buf?
+    fn parseEntries(alc: std.mem.Allocator, buf: []const u8) !std.StringArrayHashMapUnmanaged(Entry) {
         var i: usize = 0;
         const entries_len = std.mem.readInt(u16, buf[i..][0..2], .little);
         i += 2;
-        var entries = try std.ArrayListUnmanaged(Entry).initCapacity(alc, entries_len);
+        var entries: std.StringArrayHashMapUnmanaged(Entry) = .empty;
+        try entries.ensureUnusedCapacity(alc, entries_len);
 
         for (0..entries_len) |_| {
             const created = std.mem.readInt(i64, buf[i..][0..8], .little);
@@ -434,7 +390,8 @@ const Database = struct {
             i += entry_name_len;
             const fields_len = buf[i];
             i += 1;
-            var fields = try std.ArrayListUnmanaged(Entry.Field).initCapacity(alc, fields_len);
+            var fields: std.StringArrayHashMapUnmanaged(Entry.Field) = .empty;
+            try fields.ensureUnusedCapacity(alc, fields_len);
 
             for (0..fields_len) |_| {
                 const secret = buf[i] == 1;
@@ -447,16 +404,15 @@ const Database = struct {
                 i += 2;
                 const val = buf[i..][0..val_len];
                 i += val_len;
-                fields.appendAssumeCapacity(.{
+
+                fields.putAssumeCapacityNoClobber(name, .{
                     .secret = secret,
-                    .name = name,
                     .val = val,
                 });
             }
-            entries.appendAssumeCapacity(.{
+            entries.putAssumeCapacityNoClobber(entry_name, .{
                 .created = created,
                 .modified = modified,
-                .name = entry_name,
                 .fields = fields,
             });
         }
@@ -480,35 +436,25 @@ const Database = struct {
     fn serialize(db: Database, alc: std.mem.Allocator) ![]const u8 {
         var list = std.ArrayList(u8).init(alc);
         const writer = list.writer();
-        if (db.entries.items.len > 1 << 16) fatal("more than {} entries in database", .{1 << 16});
-        try writer.writeInt(u16, @intCast(db.entries.items.len), .little);
-        for (db.entries.items) |entry| {
+        if (db.entries.count() > 1 << 16) fatal("more than {} entries in database", .{1 << 16});
+        try writer.writeInt(u16, @intCast(db.entries.count()), .little);
+        for (db.entries.keys(), db.entries.values()) |entry_name, entry| {
             try writer.writeInt(i64, entry.created, .little);
             try writer.writeInt(i64, entry.modified, .little);
-            if (entry.name.len > 1 << 8) fatal("entry '{s}' longer than {}", .{ entry.name, 1 << 8 });
-            try writer.writeByte(@intCast(entry.name.len));
-            try writer.writeAll(entry.name);
-            if (entry.fields.items.len > 1 << 8) fatal("more than {} fields in '{s}'", .{ 1 << 8, entry.name });
-            try writer.writeByte(@intCast(entry.fields.items.len));
+            if (entry_name.len > 1 << 8) fatal("entry '{s}' longer than {}", .{ entry_name, 1 << 8 });
+            try writer.writeByte(@intCast(entry_name.len));
+            try writer.writeAll(entry_name);
+            if (entry.fields.count() > 1 << 8) fatal("more than {} fields in '{s}'", .{ 1 << 8, entry_name });
+            try writer.writeByte(@intCast(entry.fields.count()));
 
-            for (entry.fields.items) |field| {
+            for (entry.fields.keys(), entry.fields.values()) |field_name, field| {
                 try writer.writeByte(@intFromBool(field.secret));
-                if (field.name.len > 1 << 8) fatal("field name '{s}' longer than {} in entry '{s}'", .{ field.name, 1 << 8, entry.name });
-                try writer.writeByte(@intCast(field.name.len));
-                try writer.writeAll(field.name);
-                if (field.val.len > 1 << 16) fatal("value of field '{s}' in entry '{s}' is longer than {}", .{ field.name, entry.name, 1 << 16 });
+                if (field_name.len > 1 << 8) fatal("field name '{s}' longer than {} in entry '{s}'", .{ field_name, 1 << 8, entry_name });
+                try writer.writeByte(@intCast(field_name.len));
+                try writer.writeAll(field_name);
+                if (field.val.len > 1 << 16) fatal("value of field '{s}' in entry '{s}' is longer than {}", .{ field_name, entry_name, 1 << 16 });
                 try writer.writeInt(u16, @intCast(field.val.len), .little);
                 try writer.writeAll(field.val);
-            }
-        }
-        return list.toOwnedSlice();
-    }
-
-    pub fn attributeNames(db: Database, alc: std.mem.Allocator) ![]const u8 {
-        var list = std.ArrayList([]const u8).init(alc);
-        for (db.entries.items) |e| {
-            for (e.fields.items) |f| {
-                try list.append(f.name);
             }
         }
         return list.toOwnedSlice();
@@ -533,10 +479,6 @@ const Database = struct {
         });
     }
 };
-
-test Database {
-    _ = std.testing.allocator;
-}
 
 fn promptForPassword(alc: std.mem.Allocator) ![]const u8 {
     const stdin = std.io.getStdIn();
