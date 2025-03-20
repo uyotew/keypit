@@ -10,7 +10,7 @@ const usage =
     \\                 otherwise paste it to the clipboard with wl-copy
     \\                 (only affects 'get' subcommand)
     \\  -d filepath    path to database file, defaults to $XDG_DATA_HOME/keypit.db
-    \\  -p password    password used to decrypt and/or encrypt the database file,
+    \\  -p password    password used to decrypt the database file.
     \\                 you will be prompted if -p is not provided
     \\  -h --help      show this
     \\
@@ -50,6 +50,11 @@ const usage =
     \\
     \\     removes the entire entry
     \\
+    \\  change-password
+    \\
+    \\     change the password used to encrypt the database file.
+    \\     will be prompted for the new password twice
+    \\
 ;
 
 pub fn main() !void {
@@ -62,7 +67,7 @@ pub fn main() !void {
     var use_clipboard = true;
     var filepath_opt: ?[]const u8 = null;
     var password: ?[]const u8 = null;
-    var subcommand_opt: ?enum { get, show, modify, new, copy, rename, remove } = null;
+    var subcommand_opt: ?enum { get, show, modify, new, copy, rename, remove, change_password } = null;
     var pairs: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     var entry_name: ?[]const u8 = null;
     // field name for get, and new name for copy and rename
@@ -70,7 +75,7 @@ pub fn main() !void {
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (subcommand_opt != null and entry_name == null) {
+        if (subcommand_opt != null and subcommand_opt != .change_password and entry_name == null) {
             entry_name = args[i];
         } else if (subcommand_opt) |sub| {
             switch (sub) {
@@ -83,7 +88,7 @@ pub fn main() !void {
                     if (gop.found_existing) fatal("field '{s}' appears more than once", .{gop.key_ptr.*});
                     gop.value_ptr.* = args[i][eq_i + 1 ..];
                 } else fatal("unexpected argument '{s}'", .{args[i]}),
-                .remove, .show => fatal("unexpected argument '{s}'", .{args[i]}),
+                .remove, .show, .change_password => fatal("unexpected argument '{s}'", .{args[i]}),
             }
         } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
             std.log.info("{s}", .{usage});
@@ -112,12 +117,14 @@ pub fn main() !void {
             subcommand_opt = .rename;
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "remove")) {
             subcommand_opt = .remove;
+        } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "change-password")) {
+            subcommand_opt = .change_password;
         } else fatal("unrecognized subcommand '{s}'", .{args[i]});
     }
 
     const subcommand = subcommand_opt orelse fatal("expected subcommand", .{});
     switch (subcommand) {
-        .show => {},
+        .show, .change_password => {},
         .modify, .new, .get, .copy, .rename, .remove => {
             if (entry_name == null) fatal("subcommand '{s}' expects an entry name", .{@tagName(subcommand)});
         },
@@ -133,13 +140,13 @@ pub fn main() !void {
     // error out early (skips password prompt), and
     // arent replaced with a new file if something is modified.
     const open_mode: std.fs.File.OpenMode = switch (subcommand) {
-        .modify, .new, .copy, .rename, .remove => .read_write,
+        .modify, .new, .copy, .rename, .remove, .change_password => .read_write,
         .show, .get => .read_only,
     };
 
     const file = std.fs.cwd().openFile(filepath, .{ .mode = open_mode }) catch |err| switch (err) {
         error.FileNotFound => switch (subcommand) {
-            .show, .get, .modify, .copy, .rename, .remove => {
+            .show, .get, .modify, .copy, .rename, .remove, .change_password => {
                 fatal("subcommand '{s}' is useless on nonexistent file: {s}", .{ @tagName(subcommand), filepath });
             },
             .new => null,
@@ -247,6 +254,13 @@ pub fn main() !void {
         },
         .remove => if (!database.entries.orderedRemove(entry_name.?)) {
             fatal("entry '{s}' not found", .{entry_name.?});
+        },
+        .change_password => {
+            try stdout.writeAll("New ");
+            const new_password = try promptForPassword(arena);
+            try stdout.writeAll("Repeat New ");
+            if (!std.mem.eql(u8, new_password, try promptForPassword(arena))) fatal("not the same password", .{});
+            Sha3_256.hash(new_password, &key, .{});
         },
     }
 
@@ -487,7 +501,7 @@ fn promptForPassword(alc: std.mem.Allocator) ![]const u8 {
     const reader = stdin.reader();
     const writer = std.io.getStdOut().writer();
 
-    try writer.writeAll("Passphrase:");
+    try writer.writeAll("Password: ");
 
     const original_termios = std.posix.tcgetattr(stdin.handle) catch unreachable;
     var termios = original_termios;
