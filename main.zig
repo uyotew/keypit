@@ -13,6 +13,7 @@ const usage =
     \\  -p password    password used to decrypt the database file.
     \\                 you will be prompted if -p is not provided
     \\  -h --help      show this
+    \\  -v --version   show keypit format version
     \\
     \\ subcommands:
     \\  get name [fieldname]
@@ -91,7 +92,10 @@ pub fn main() !void {
                 .remove, .show, .change_password => fatal("unexpected argument '{s}'", .{args[i]}),
             }
         } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
-            std.log.info("{s}", .{usage});
+            std.log.info("usage: {s}", .{usage});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, args[i], "-v") or std.mem.eql(u8, args[i], "--version")) {
+            std.log.info("version: {}", .{Database.version});
             std.process.exit(0);
         } else if (std.mem.eql(u8, args[i], "--stdout")) {
             use_clipboard = false;
@@ -276,6 +280,7 @@ pub fn main() !void {
 // unencrypted part:
 // first, a u16, version number, which changes when this format changes
 // then a 16 byte tag, mac code, to be used in decryption
+// then a 32 byte nonce, used in decryption as well
 // the rest is aegis256 encrypted data
 
 // when the encrypted data is decrypted, it's format is as follows
@@ -295,12 +300,8 @@ pub fn main() !void {
 
 const Database = struct {
     entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
-    tag: ?[16]u8 = null,
 
-    const version: u16 = 0;
-
-    const ad = [_]u8{};
-    const nonce = [_]u8{0xfa} ** 32;
+    const version: u16 = 1;
 
     comptime {
         std.debug.assert(Aegis256.tag_length == 16);
@@ -369,20 +370,21 @@ const Database = struct {
     pub fn readFile(alc: std.mem.Allocator, file: std.fs.File, key: [32]u8) !Database {
         const reader = file.reader();
         const file_version = try reader.readInt(u16, .little);
-        if (file_version != Database.version) {
+        if (file_version > Database.version) {
             fatal("file is version {}, keypit is version {}", .{ file_version, Database.version });
         }
         const tag = try reader.readBytesNoEof(16);
+        // 0-eth version used a constant nonce
+        const nonce = if (file_version == 0) [_]u8{0xfa} ** 32 else try reader.readBytesNoEof(32);
         const ciphertext = try reader.readAllAlloc(alc, 1 << 32);
         defer alc.free(ciphertext);
 
         const buf = try alc.alloc(u8, ciphertext.len);
 
-        try Aegis256.decrypt(buf, ciphertext, tag, &ad, nonce, key);
+        try Aegis256.decrypt(buf, ciphertext, tag, &.{}, nonce, key);
 
         return .{
             .entries = try parseEntries(alc, buf),
-            .tag = tag,
         };
     }
 
@@ -440,11 +442,14 @@ const Database = struct {
         const ciphertext = try alc.alloc(u8, buf.len);
         defer alc.free(ciphertext);
 
-        var new_tag: [16]u8 = undefined;
-        Aegis256.encrypt(ciphertext, &new_tag, buf, &ad, nonce, key);
+        var tag: [16]u8 = undefined;
+        var nonce: [32]u8 = undefined;
+        try std.posix.getrandom(&nonce);
+        Aegis256.encrypt(ciphertext, &tag, buf, &.{}, nonce, key);
 
         try writer.writeInt(u16, version, .little);
-        try writer.writeAll(&new_tag);
+        try writer.writeAll(&tag);
+        try writer.writeAll(&nonce);
         try writer.writeAll(ciphertext);
     }
 
