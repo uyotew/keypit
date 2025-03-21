@@ -4,57 +4,32 @@ const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
 const fatal = std.process.fatal;
 
 const usage =
-    \\keypit [--stdout] [-d database_file] [-p password] subcommand
+    \\usage:
+    \\ keypit [--stdout] [-d filepath] [-p password] subcommand
     \\
-    \\  --stdout       write the value of the chosen field to stdout,
-    \\                 otherwise paste it to the clipboard with wl-copy
-    \\                 (only affects 'get' subcommand)
+    \\  --stdout       when using 'get', write field value to stdout,
+    \\                 defaults to write to clipboard with wl-copy
     \\  -d filepath    path to database file, defaults to $XDG_DATA_HOME/keypit.db
-    \\  -p password    password used to decrypt the database file.
-    \\                 you will be prompted if -p is not provided
-    \\  -h --help      show this
-    \\  -v --version   show keypit format version
+    \\  -p password    skip prompt, and use password to decrypt the database file
+    \\  -h --help      show this help
+    \\  -v --version   show keypit file format version
     \\
     \\ subcommands:
-    \\  get name [fieldname]
-    \\
-    \\     if the entry only has one secret field, 
-    \\     it's value will be retrieved by default.
-    \\     and the clipboard will be cleared after one paste.
-    \\
-    \\  show [name] 
-    \\
-    \\     show every entry-name in the database.
-    \\     if name is provided, show the contents of that entry 
-    \\ 
-    \\  modify name [fieldname=value ...] 
-    \\  new name [fieldname=value ...]
-    \\
-    \\     modify or create entries. if value is empty, the field is removed.
-    \\     if ? comes after =, as in field=?value, the field's value will be secret.
-    \\     if no value is provided after ?, the secret defaults to a random
-    \\     64 byte long string of printable characters
-    \\
-    \\     if you wish to generate the secret differently, you can use
-    \\     for example: fieldname=??a30
-    \\     where you add an extra ?, and 'a' means alphanumeric,
-    \\     and the number is the length of the generated string.
-    \\     use 'p' instead of 'a' for all printable characters.
-    \\
-    \\  copy name new-name
-    \\  rename name new-name
-    \\
-    \\     copy will create a new entry, with a new creation timestamp
-    \\     rename will only change the entry's name
-    \\
-    \\  remove name
-    \\
-    \\     removes the entire entry
-    \\
+    \\  get    entry-name [field-name]
+    \\  show   [entry-name]
+    \\  modify entry-name [field-name=value ...]
+    \\  new    entry-name [field-name=value ...]
+    \\  copy   entry-name new-entry-name
+    \\  rename entry-name new-entry-name
+    \\  remove entry-name
     \\  change-password
     \\
-    \\     change the password used to encrypt the database file.
-    \\     will be prompted for the new password twice
+    \\ new and modify: field-name=value
+    \\  field-name=         the field is removed
+    \\  field-name=?value   value is secret
+    \\  field-name=?        generate 64 byte string of printable characters
+    \\  field-name=??pN     generate N byte string of printable characters
+    \\  field-name=??aN     generate N byte string of alphanumeric characters
     \\
 ;
 
@@ -92,7 +67,7 @@ pub fn main() !void {
                 .remove, .show, .change_password => fatal("unexpected argument '{s}'", .{args[i]}),
             }
         } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
-            std.log.info("usage: {s}", .{usage});
+            std.log.info("{s}", .{usage});
             std.process.exit(0);
         } else if (std.mem.eql(u8, args[i], "-v") or std.mem.eql(u8, args[i], "--version")) {
             std.log.info("version: {}", .{Database.version});
@@ -198,7 +173,28 @@ pub fn main() !void {
             }
 
             if (use_clipboard) {
-                var proc = std.process.Child.init(&.{ "wl-copy", "-o", value }, arena);
+                var proc = std.process.Child.init(&.{ "wl-copy", value }, arena);
+                _ = proc.spawnAndWait() catch |err| switch (err) {
+                    error.FileNotFound => fatal("wl-copy could not be found", .{}),
+                    else => return err,
+                };
+                const stdin = std.io.getStdIn();
+
+                const original_termios = std.posix.tcgetattr(stdin.handle) catch unreachable;
+                var termios = original_termios;
+                termios.lflag.ISIG = false;
+                termios.lflag.ECHO = false;
+                termios.lflag.ICANON = false;
+                std.posix.tcsetattr(stdin.handle, .FLUSH, termios) catch unreachable;
+                defer std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch unreachable;
+
+                try stdout.print("press any key to clear clipboard and quit", .{});
+                _ = try stdin.reader().readByte();
+
+                // clear line
+                try stdout.writeAll("\x1b[G\x1b[K");
+
+                proc = std.process.Child.init(&.{ "wl-copy", "-c" }, arena);
                 _ = proc.spawnAndWait() catch |err| switch (err) {
                     error.FileNotFound => fatal("wl-copy could not be found", .{}),
                     else => return err,

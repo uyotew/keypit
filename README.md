@@ -1,3 +1,6 @@
-single user password/secret manager
-database is just a symetrically encrypted file with serialized data.
-keypit is just used to decrypt+encrypt it and access/edit it.
+# Keypit
+simple password/secret manager
+
+keypit just decrypts, modifies and encrypts a file with some entries
+
+compiling in termux produces errors, but the executable is still produced
