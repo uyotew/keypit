@@ -130,6 +130,11 @@ pub fn main() !void {
             },
             .new => null,
         },
+        error.AccessDenied => switch (open_mode) {
+            .read_write => fatal("write access denied for {s}", .{filepath}),
+            .read_only => fatal("read access denied for {s}", .{filepath}),
+            else => unreachable,
+        },
         else => return err,
     };
 
@@ -377,7 +382,9 @@ const Database = struct {
 
         const buf = try alc.alloc(u8, ciphertext.len);
 
-        try Aegis256.decrypt(buf, ciphertext, tag, &.{}, nonce, key);
+        Aegis256.decrypt(buf, ciphertext, tag, &.{}, nonce, key) catch |err| switch (err) {
+            error.AuthenticationFailed => fatal("authentication failed", .{}),
+        };
 
         return .{
             .entries = try parseEntries(alc, buf),
