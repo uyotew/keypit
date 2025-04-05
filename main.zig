@@ -272,6 +272,7 @@ pub fn main() !void {
     var atomic_file = try std.fs.cwd().atomicFile(filepath, .{});
     defer atomic_file.deinit();
     try database.write(arena, key, atomic_file.file.writer());
+    try atomic_file.file.sync();
     try atomic_file.finish();
 }
 
