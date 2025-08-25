@@ -3,6 +3,9 @@ const Aegis256 = std.crypto.aead.aegis.Aegis256;
 const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
 const fatal = std.process.fatal;
 
+var read_buffer: [4096]u8 = undefined;
+var write_buffer: [4096]u8 = undefined;
+
 const usage =
     \\usage:
     \\ keypit [--stdout] [-d filepath] [-p password] subcommand
@@ -15,13 +18,13 @@ const usage =
     \\  -v --version   show keypit file format version
     \\
     \\ subcommands:
-    \\  get    entry-name [field-name]
-    \\  show   [entry-name]
-    \\  modify entry-name [field-name=value ...]
-    \\  new    entry-name [field-name=value ...]
-    \\  copy   entry-name new-entry-name
-    \\  rename entry-name new-entry-name
-    \\  remove entry-name
+    \\  get              entry-name [field-name]
+    \\  show             [entry-name]
+    \\  modify           entry-name [field-name=value ...]
+    \\  new              entry-name [field-name=value ...]
+    \\  copy             entry-name new-entry-name
+    \\  rename           entry-name new-entry-name
+    \\  remove           entry-name
     \\  change-password
     \\
     \\ new and modify: field-name=value
@@ -144,18 +147,20 @@ pub fn main() !void {
     var database: Database = if (file) |f| try .readFile(arena, f, key) else .{};
     if (file) |f| f.close();
 
-    const stdout = std.io.getStdOut().writer();
+    var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
+    const stdout = &stdout_writer.interface;
 
     switch (subcommand) {
         .show => {
             if (entry_name) |name| {
                 const entry = database.entries.get(name) orelse fatal("entry '{s}' not found", .{name});
-                try stdout.print("{s}\n{}\n", .{ name, entry });
+                try stdout.print("{s}\n{f}\n", .{ name, entry });
             } else {
                 for (database.entries.keys(), database.entries.values()) |entry_n, entry| {
-                    try stdout.print("{s}\n{}\n", .{ entry_n, entry });
+                    try stdout.print("{s}\n{f}\n", .{ entry_n, entry });
                 }
             }
+            try stdout.flush();
             std.process.exit(0);
         },
         .get => {
@@ -183,18 +188,20 @@ pub fn main() !void {
                     error.FileNotFound => fatal("wl-copy could not be found", .{}),
                     else => return err,
                 };
-                const stdin = std.io.getStdIn();
+                const stdin_file = std.fs.File.stdin();
 
-                const original_termios = std.posix.tcgetattr(stdin.handle) catch unreachable;
+                const original_termios = std.posix.tcgetattr(stdin_file.handle) catch unreachable;
                 var termios = original_termios;
                 termios.lflag.ISIG = false;
                 termios.lflag.ECHO = false;
                 termios.lflag.ICANON = false;
-                std.posix.tcsetattr(stdin.handle, .FLUSH, termios) catch unreachable;
-                defer std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch unreachable;
+                std.posix.tcsetattr(stdin_file.handle, .FLUSH, termios) catch unreachable;
+                defer std.posix.tcsetattr(stdin_file.handle, .FLUSH, original_termios) catch unreachable;
 
                 try stdout.print("press any key to clear clipboard and quit", .{});
-                _ = try stdin.reader().readByte();
+                try stdout.flush();
+                var stdin_reader = stdin_file.reader(&read_buffer);
+                _ = try stdin_reader.interface.takeByte();
 
                 // clear line
                 try stdout.writeAll("\x1b[G\x1b[K");
@@ -207,6 +214,7 @@ pub fn main() !void {
             } else {
                 try stdout.print("{s}\n", .{value});
             }
+            try stdout.flush();
             std.process.exit(0);
         },
         .new => {
@@ -262,17 +270,19 @@ pub fn main() !void {
         },
         .change_password => {
             try stdout.writeAll("New ");
+            try stdout.flush();
             const new_password = try promptForPassword(arena);
             try stdout.writeAll("Repeat New ");
+            try stdout.flush();
             if (!std.mem.eql(u8, new_password, try promptForPassword(arena))) fatal("not the same password", .{});
             Sha3_256.hash(new_password, &key, .{});
         },
     }
 
-    var atomic_file = try std.fs.cwd().atomicFile(filepath, .{});
+    var atomic_file = try std.fs.cwd().atomicFile(filepath, .{ .write_buffer = &write_buffer });
     defer atomic_file.deinit();
-    try database.write(arena, key, atomic_file.file.writer());
-    try atomic_file.file.sync();
+    try database.write(&atomic_file.file_writer.interface, arena, key);
+    try atomic_file.file_writer.file.sync();
     try atomic_file.finish();
 }
 
@@ -349,36 +359,57 @@ const Database = struct {
             }
         };
 
-        pub fn format(entry: Entry, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(entry: Entry, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll(" created: ");
-            try dateFormat(entry.created, writer);
+            try dateFormat(writer, entry.created);
             try writer.writeByte('\n');
             try writer.writeAll(" modified: ");
-            try dateFormat(entry.modified, writer);
+            try dateFormat(writer, entry.modified);
             try writer.writeByte('\n');
 
             for (entry.fields.keys(), entry.fields.values()) |field_name, field| {
                 try writer.print("  {s}: ", .{field_name});
                 if (field.secret) {
-                    try writer.writeByteNTimes('*', field.val.len);
+                    try writer.splatByteAll('*', field.val.len);
                 } else {
                     try writer.print("{s}", .{field.val});
                 }
                 try writer.writeByte('\n');
             }
         }
+
+        fn dateFormat(writer: *std.Io.Writer, stamp_secs: i64) !void {
+            const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(stamp_secs) };
+            const day_secs = epoch.getDaySeconds();
+            const hour = day_secs.getHoursIntoDay();
+            const minute = day_secs.getMinutesIntoHour();
+            const secs = day_secs.getSecondsIntoMinute();
+            const year_day = epoch.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+
+            try writer.print("{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2} CET", .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                hour,
+                minute,
+                secs,
+            });
+        }
     };
 
     pub fn readFile(alc: std.mem.Allocator, file: std.fs.File, key: [32]u8) !Database {
-        const reader = file.reader();
-        const file_version = try reader.readInt(u16, .little);
+        var file_reader = file.reader(&read_buffer);
+        const r = &file_reader.interface;
+
+        const file_version = try r.takeInt(u16, .little);
         if (file_version > Database.version) {
             fatal("file is version {}, keypit is version {}", .{ file_version, Database.version });
         }
-        const tag = try reader.readBytesNoEof(16);
+        const tag = (try r.takeArray(16)).*;
         // 0-eth version used a constant nonce
-        const nonce = if (file_version == 0) [_]u8{0xfa} ** 32 else try reader.readBytesNoEof(32);
-        const ciphertext = try reader.readAllAlloc(alc, 1 << 32);
+        const nonce = if (file_version == 0) [_]u8{0xfa} ** 32 else (try r.takeArray(32)).*;
+        const ciphertext = try r.allocRemaining(alc, .unlimited);
         defer alc.free(ciphertext);
 
         const buf = try alc.alloc(u8, ciphertext.len);
@@ -394,37 +425,29 @@ const Database = struct {
 
     // returned hash map holds references to slices in buf?
     fn parseEntries(alc: std.mem.Allocator, buf: []const u8) !std.StringArrayHashMapUnmanaged(Entry) {
-        var i: usize = 0;
-        const entries_len = std.mem.readInt(u16, buf[i..][0..2], .little);
-        i += 2;
+        var r: std.Io.Reader = .fixed(buf);
+
+        const entries_len = try r.takeInt(u16, .little);
+
         var entries: std.StringArrayHashMapUnmanaged(Entry) = .empty;
         try entries.ensureUnusedCapacity(alc, entries_len);
 
         for (0..entries_len) |_| {
-            const created = std.mem.readInt(i64, buf[i..][0..8], .little);
-            i += 8;
-            const modified = std.mem.readInt(i64, buf[i..][0..8], .little);
-            i += 8;
-            const entry_name_len = buf[i];
-            i += 1;
-            const entry_name = buf[i..][0..entry_name_len];
-            i += entry_name_len;
-            const fields_len = buf[i];
-            i += 1;
+            const created = try r.takeInt(i64, .little);
+            const modified = try r.takeInt(i64, .little);
+            const entry_name_len = try r.takeByte();
+            const entry_name = try r.take(entry_name_len);
+            const fields_len = try r.takeByte();
+
             var fields: std.StringArrayHashMapUnmanaged(Entry.Field) = .empty;
             try fields.ensureUnusedCapacity(alc, fields_len);
 
             for (0..fields_len) |_| {
-                const secret = buf[i] == 1;
-                i += 1;
-                const name_len = buf[i];
-                i += 1;
-                const name = buf[i..][0..name_len];
-                i += name_len;
-                const val_len = std.mem.readInt(u16, buf[i..][0..2], .little);
-                i += 2;
-                const val = buf[i..][0..val_len];
-                i += val_len;
+                const secret = 1 == try r.takeByte();
+                const name_len = try r.takeByte();
+                const name = try r.take(name_len);
+                const val_len = try r.takeInt(u16, .little);
+                const val = try r.take(val_len);
 
                 fields.putAssumeCapacityNoClobber(name, .{
                     .secret = secret,
@@ -440,7 +463,7 @@ const Database = struct {
         return entries;
     }
 
-    pub fn write(db: Database, alc: std.mem.Allocator, key: [32]u8, writer: anytype) !void {
+    pub fn write(db: Database, writer: *std.Io.Writer, alc: std.mem.Allocator, key: [32]u8) !void {
         const buf = try db.serialize(alc);
         defer alc.free(buf);
         const ciphertext = try alc.alloc(u8, buf.len);
@@ -458,73 +481,63 @@ const Database = struct {
     }
 
     fn serialize(db: Database, alc: std.mem.Allocator) ![]const u8 {
-        var list = std.ArrayList(u8).init(alc);
-        const writer = list.writer();
+        var aw: std.Io.Writer.Allocating = .init(alc);
+
         if (db.entries.count() > 1 << 16) fatal("more than {} entries in database", .{1 << 16});
-        try writer.writeInt(u16, @intCast(db.entries.count()), .little);
+        try aw.writer.writeInt(u16, @intCast(db.entries.count()), .little);
         for (db.entries.keys(), db.entries.values()) |entry_name, entry| {
-            try writer.writeInt(i64, entry.created, .little);
-            try writer.writeInt(i64, entry.modified, .little);
+            try aw.writer.writeInt(i64, entry.created, .little);
+            try aw.writer.writeInt(i64, entry.modified, .little);
             if (entry_name.len > 1 << 8) fatal("entry '{s}' longer than {}", .{ entry_name, 1 << 8 });
-            try writer.writeByte(@intCast(entry_name.len));
-            try writer.writeAll(entry_name);
+            try aw.writer.writeByte(@intCast(entry_name.len));
+            try aw.writer.writeAll(entry_name);
             if (entry.fields.count() > 1 << 8) fatal("more than {} fields in '{s}'", .{ 1 << 8, entry_name });
-            try writer.writeByte(@intCast(entry.fields.count()));
+            try aw.writer.writeByte(@intCast(entry.fields.count()));
 
             for (entry.fields.keys(), entry.fields.values()) |field_name, field| {
-                try writer.writeByte(@intFromBool(field.secret));
+                try aw.writer.writeByte(@intFromBool(field.secret));
                 if (field_name.len > 1 << 8) fatal("field name '{s}' longer than {} in entry '{s}'", .{ field_name, 1 << 8, entry_name });
-                try writer.writeByte(@intCast(field_name.len));
-                try writer.writeAll(field_name);
+                try aw.writer.writeByte(@intCast(field_name.len));
+                try aw.writer.writeAll(field_name);
                 if (field.val.len > 1 << 16) fatal("value of field '{s}' in entry '{s}' is longer than {}", .{ field_name, entry_name, 1 << 16 });
-                try writer.writeInt(u16, @intCast(field.val.len), .little);
-                try writer.writeAll(field.val);
+                try aw.writer.writeInt(u16, @intCast(field.val.len), .little);
+                try aw.writer.writeAll(field.val);
             }
         }
-        return list.toOwnedSlice();
-    }
-
-    fn dateFormat(stamp_secs: i64, writer: anytype) !void {
-        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(stamp_secs) };
-        const day_secs = epoch.getDaySeconds();
-        const hour = day_secs.getHoursIntoDay();
-        const minute = day_secs.getMinutesIntoHour();
-        const secs = day_secs.getSecondsIntoMinute();
-        const year_day = epoch.getEpochDay().calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-
-        try writer.print("{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2} CET", .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
-            hour,
-            minute,
-            secs,
-        });
+        return aw.toOwnedSlice();
     }
 };
 
 fn promptForPassword(alc: std.mem.Allocator) ![]const u8 {
-    const stdin = std.io.getStdIn();
-    if (!stdin.isTty()) return error.NotATty;
-    const reader = stdin.reader();
-    const writer = std.io.getStdOut().writer();
+    const stdin_file = std.fs.File.stdin();
+    if (!stdin_file.isTty()) return error.NotATty;
 
-    try writer.writeAll("Password: ");
+    var stdin_reader = stdin_file.reader(&read_buffer);
+    const stdin = &stdin_reader.interface;
 
-    const original_termios = std.posix.tcgetattr(stdin.handle) catch unreachable;
+    var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.writeAll("Password: ");
+    try stdout.flush();
+
+    const original_termios = std.posix.tcgetattr(stdin_file.handle) catch unreachable;
     var termios = original_termios;
     termios.lflag.ECHO = false;
-    std.posix.tcsetattr(stdin.handle, .FLUSH, termios) catch unreachable;
-    defer std.posix.tcsetattr(stdin.handle, .FLUSH, original_termios) catch unreachable;
+    std.posix.tcsetattr(stdin_file.handle, .FLUSH, termios) catch unreachable;
+    defer std.posix.tcsetattr(stdin_file.handle, .FLUSH, original_termios) catch unreachable;
 
-    var al: std.ArrayList(u8) = .init(alc);
-    try reader.streamUntilDelimiter(al.writer(), '\n', 1 << 16);
+    var aw: std.Io.Writer.Allocating = .init(alc);
+    _ = stdin.streamDelimiterLimit(&aw.writer, '\n', .limited(4096)) catch |err| switch (err) {
+        error.StreamTooLong => return error.PasswordTooLong,
+        else => return err,
+    };
 
     // clear line
-    try writer.writeAll("\x1b[G\x1b[K");
+    try stdout.writeAll("\x1b[G\x1b[K");
+    try stdout.flush();
 
-    return al.toOwnedSlice();
+    return aw.toOwnedSlice();
 }
 
 fn generateSecret(out: []u8, char_set: enum { printable, alphanumeric }) !void {
