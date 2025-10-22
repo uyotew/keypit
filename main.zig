@@ -1,6 +1,7 @@
 const std = @import("std");
 const Aegis256 = std.crypto.aead.aegis.Aegis256;
 const Sha3_256 = std.crypto.hash.sha3.Sha3_256;
+const argon2 = std.crypto.pwhash.argon2;
 const fatal = std.process.fatal;
 
 var read_buffer: [4096]u8 = undefined;
@@ -45,7 +46,7 @@ pub fn main() !void {
 
     var use_clipboard = true;
     var filepath_opt: ?[]const u8 = null;
-    var password: ?[]const u8 = null;
+    var password_opt: ?[]const u8 = null;
     var subcommand_opt: ?enum { get, show, modify, new, copy, rename, remove, change_password } = null;
     var pairs: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     var entry_name: ?[]const u8 = null;
@@ -84,7 +85,7 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "-p")) {
             i += 1;
             if (i >= args.len) fatal("expected password after -p", .{});
-            password = args[i];
+            password_opt = args[i];
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "get")) {
             subcommand_opt = .get;
         } else if (subcommand_opt == null and std.mem.eql(u8, args[i], "show")) {
@@ -141,10 +142,9 @@ pub fn main() !void {
         else => return err,
     };
 
-    var key: [32]u8 = undefined;
-    Sha3_256.hash(password orelse try promptForPassword(arena), &key, .{});
+    var password = password_opt orelse try promptForPassword(arena);
 
-    var database: Database = if (file) |f| try .readFile(arena, f, key) else .{};
+    var database: Database = if (file) |f| try .readFile(arena, f, password) else .{};
     if (file) |f| f.close();
 
     var stdout_writer = std.fs.File.stdout().writer(&write_buffer);
@@ -271,17 +271,16 @@ pub fn main() !void {
         .change_password => {
             try stdout.writeAll("New ");
             try stdout.flush();
-            const new_password = try promptForPassword(arena);
+            password = try promptForPassword(arena);
             try stdout.writeAll("Repeat New ");
             try stdout.flush();
-            if (!std.mem.eql(u8, new_password, try promptForPassword(arena))) fatal("not the same password", .{});
-            Sha3_256.hash(new_password, &key, .{});
+            if (!std.mem.eql(u8, password, try promptForPassword(arena))) fatal("not the same password", .{});
         },
     }
 
     var atomic_file = try std.fs.cwd().atomicFile(filepath, .{ .write_buffer = &write_buffer });
     defer atomic_file.deinit();
-    try database.write(&atomic_file.file_writer.interface, arena, key);
+    try database.write(&atomic_file.file_writer.interface, arena, password);
     try atomic_file.file_writer.file.sync();
     try atomic_file.finish();
 }
@@ -292,7 +291,7 @@ pub fn main() !void {
 // unencrypted part:
 // first, a u16, version number, which changes when this format changes
 // then a 16 byte tag, mac code, to be used in decryption
-// then a 32 byte nonce, used in decryption as well
+// then a 32 byte nonce, used in decryption, and as the argon2 salt
 // the rest is aegis256 encrypted data
 
 // when the encrypted data is decrypted, it's format is as follows
@@ -304,7 +303,7 @@ pub fn main() !void {
 // unique name bytes
 // u8, number of fields in entry,
 // for each field:
-// u8, if 1, then the field is 'secret', other attributes might be added later?
+// u8, if 1, then the field is 'secret', other attributes/flags might be added later?
 // u8, length of field name
 // field name bytes
 // u16, length of field value
@@ -313,7 +312,7 @@ pub fn main() !void {
 const Database = struct {
     entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
 
-    const version: u16 = 1;
+    const version: u16 = 2;
 
     comptime {
         std.debug.assert(Aegis256.tag_length == 16);
@@ -398,19 +397,26 @@ const Database = struct {
         }
     };
 
-    pub fn readFile(alc: std.mem.Allocator, file: std.fs.File, key: [32]u8) !Database {
+    pub fn readFile(alc: std.mem.Allocator, file: std.fs.File, password: []const u8) !Database {
         var file_reader = file.reader(&read_buffer);
         const r = &file_reader.interface;
 
         const file_version = try r.takeInt(u16, .little);
-        if (file_version > Database.version) {
-            fatal("file is version {}, keypit is version {}", .{ file_version, Database.version });
+        switch (file_version) {
+            1...Database.version => {},
+            else => fatal("file version {} unsupported", .{file_version}),
         }
         const tag = (try r.takeArray(16)).*;
-        // 0-eth version used a constant nonce
-        const nonce = if (file_version == 0) [_]u8{0xfa} ** 32 else (try r.takeArray(32)).*;
+        const nonce = (try r.takeArray(32)).*;
         const ciphertext = try r.allocRemaining(alc, .unlimited);
         defer alc.free(ciphertext);
+
+        var key: [32]u8 = undefined;
+        switch (file_version) {
+            0 => unreachable,
+            1 => Sha3_256.hash(password, &key, .{}),
+            else => try argon2.kdf(alc, &key, password, &nonce, .owasp_2id, .argon2id),
+        }
 
         const buf = try alc.alloc(u8, ciphertext.len);
 
@@ -463,7 +469,7 @@ const Database = struct {
         return entries;
     }
 
-    pub fn write(db: Database, writer: *std.Io.Writer, alc: std.mem.Allocator, key: [32]u8) !void {
+    pub fn write(db: Database, writer: *std.Io.Writer, alc: std.mem.Allocator, password: []const u8) !void {
         const buf = try db.serialize(alc);
         defer alc.free(buf);
         const ciphertext = try alc.alloc(u8, buf.len);
@@ -472,6 +478,10 @@ const Database = struct {
         var tag: [16]u8 = undefined;
         var nonce: [32]u8 = undefined;
         try std.posix.getrandom(&nonce);
+
+        var key: [32]u8 = undefined;
+        try argon2.kdf(alc, &key, password, &nonce, .owasp_2id, .argon2id);
+
         Aegis256.encrypt(ciphertext, &tag, buf, &.{}, nonce, key);
 
         try writer.writeInt(u16, version, .little);
