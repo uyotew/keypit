@@ -183,6 +183,14 @@ pub fn main() !void {
             }
 
             if (use_clipboard) {
+                if (std.posix.getenv("TERMUX_VERSION") != null) {
+                    var proc = std.process.Child.init(&.{ "termux-clipboard-set", value }, arena);
+                    _ = proc.spawnAndWait() catch |err| switch (err) {
+                        error.FileNotFound => fatal("termux-clipboard-set could not be found", .{}),
+                        else => return err,
+                    };
+                    std.process.exit(0);
+                }
                 var proc = std.process.Child.init(&.{ "wl-copy", value }, arena);
                 _ = proc.spawnAndWait() catch |err| switch (err) {
                     error.FileNotFound => fatal("wl-copy could not be found", .{}),
